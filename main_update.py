@@ -3,14 +3,19 @@ from PiicoDev_RV3028 import PiicoDev_RV3028
 from PiicoDev_SSD1306 import *
 from PiicoDev_Buzzer import PiicoDev_Buzzer
 from PiicoDev_Unified import sleep_ms
+
 import time
 import network
 import socket
+import machine
+import os
 
-# =========================
-# WIFI SETTINGS
-# =========================
-from secrets import WIFI_NAME, WIFI_PASSWORD
+try:
+    import urequests as requests
+except:
+    import requests
+
+from secrets import WIFI_NAME, WIFI_PASSWORD, UPDATE_URL
 
 # =========================
 # SYSTEM SETTINGS
@@ -34,6 +39,9 @@ MAX_HISTORY = 20
 
 WEB_CHECK_INTERVAL_MS = 100
 
+DOWNLOADED_UPDATE_FILE = "main_downloaded.py"
+BACKUP_FILE = "main_backup.py"
+
 # =========================
 # HARDWARE SETUP
 # =========================
@@ -42,40 +50,6 @@ sensor = PiicoDev_BME280()
 rtc = PiicoDev_RV3028()
 display = create_PiicoDev_SSD1306()
 buzzer = PiicoDev_Buzzer(volume=BUZZER_VOLUME)
-
-# =========================
-# WIFI SETUP
-# =========================
-
-display.fill(0)
-display.text("Connecting WiFi", 0, 0, 1)
-display.show()
-
-wlan = network.WLAN(network.STA_IF)
-wlan.active(True)
-wlan.connect(WIFI_NAME, WIFI_PASSWORD)
-
-while not wlan.isconnected():
-    sleep_ms(500)
-
-ip = wlan.ifconfig()[0]
-
-display.fill(0)
-display.text("WiFi Connected", 0, 0, 1)
-display.text(ip, 0, 16, 1)
-display.show()
-sleep_ms(1500)
-
-# =========================
-# WEB SERVER SETUP
-# =========================
-
-addr = socket.getaddrinfo("0.0.0.0", 80)[0][-1]
-server = socket.socket()
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(addr)
-server.listen(1)
-server.settimeout(0.05)
 
 # =========================
 # GLOBAL VARIABLES
@@ -109,6 +83,62 @@ latest_status = "STARTING"
 weather_prediction = "Collecting data"
 
 last_sample_ms = time.ticks_ms()
+last_update_message = "No update checked yet"
+
+# =========================
+# OLED HELPERS
+# =========================
+
+def oled_message(line1="", line2="", line3="", line4=""):
+    display.fill(0)
+
+    if line1:
+        display.text(str(line1), 0, 0, 1)
+    if line2:
+        display.text(str(line2), 0, 16, 1)
+    if line3:
+        display.text(str(line3), 0, 32, 1)
+    if line4:
+        display.text(str(line4), 0, 48, 1)
+
+    display.show()
+
+# =========================
+# WIFI SETUP
+# =========================
+
+oled_message("Connecting", "WiFi...")
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect(WIFI_NAME, WIFI_PASSWORD)
+
+wifi_timeout = 0
+
+while not wlan.isconnected():
+    sleep_ms(500)
+    wifi_timeout += 1
+
+    if wifi_timeout > 40:
+        oled_message("WiFi Failed", "Check details")
+        sleep_ms(3000)
+        machine.reset()
+
+ip = wlan.ifconfig()[0]
+
+oled_message("WiFi Connected", ip)
+sleep_ms(1500)
+
+# =========================
+# WEB SERVER SETUP
+# =========================
+
+addr = socket.getaddrinfo("0.0.0.0", 80)[0][-1]
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(addr)
+server.listen(1)
+server.settimeout(0.05)
 
 # =========================
 # BUZZER MELODIES
@@ -131,8 +161,10 @@ def warning_melody():
 
 def startup_melody():
     notes = [
-        (523, 120), (659, 120), (784, 160),
-        (1046, 220)
+        (523, 120),
+        (659, 120),
+        (784, 160),
+        (1046, 220),
     ]
 
     for freq, duration in notes:
@@ -143,6 +175,104 @@ def startup_melody():
 
 
 startup_melody()
+
+# =========================
+# OTA UPDATE FUNCTIONS
+# =========================
+
+def file_exists(filename):
+    try:
+        os.stat(filename)
+        return True
+    except:
+        return False
+
+
+def download_update():
+    global last_update_message
+
+    try:
+        oled_message("Checking", "GitHub update")
+
+        response = requests.get(UPDATE_URL)
+
+        if response.status_code == 200:
+            new_code = response.text
+            response.close()
+
+            if len(new_code) < 500:
+                last_update_message = "Update too small"
+                oled_message("Update Failed", "File too small")
+                return last_update_message
+
+            if "from secrets import" not in new_code:
+                last_update_message = "Update missing secrets"
+                oled_message("Update Failed", "Bad file")
+                return last_update_message
+
+            with open(DOWNLOADED_UPDATE_FILE, "w") as f:
+                f.write(new_code)
+
+            last_update_message = "Update downloaded"
+            oled_message("Update Saved", DOWNLOADED_UPDATE_FILE)
+            return last_update_message
+
+        else:
+            code = response.status_code
+            response.close()
+            last_update_message = "HTTP error " + str(code)
+            oled_message("Update Failed", str(code))
+            return last_update_message
+
+    except Exception as e:
+        last_update_message = "Update error"
+        oled_message("Update Error", "Check WiFi/link")
+        return last_update_message
+
+
+def install_update():
+    global last_update_message
+
+    try:
+        if not file_exists(DOWNLOADED_UPDATE_FILE):
+            last_update_message = "No update file"
+            oled_message("Install Failed", "No update file")
+            return last_update_message
+
+        if file_exists(BACKUP_FILE):
+            try:
+                os.remove(BACKUP_FILE)
+            except:
+                pass
+
+        if file_exists("main.py"):
+            os.rename("main.py", BACKUP_FILE)
+
+        os.rename(DOWNLOADED_UPDATE_FILE, "main.py")
+
+        last_update_message = "Installed update"
+        oled_message("Update Installed", "Rebooting...")
+        sleep_ms(2000)
+        machine.reset()
+
+    except Exception as e:
+        last_update_message = "Install error"
+
+        try:
+            if not file_exists("main.py") and file_exists(BACKUP_FILE):
+                os.rename(BACKUP_FILE, "main.py")
+                last_update_message = "Restored backup"
+        except:
+            pass
+
+        oled_message("Install Error", "Backup restored")
+        return last_update_message
+
+
+def reboot_pico():
+    oled_message("Rebooting", "Pico W...")
+    sleep_ms(1000)
+    machine.reset()
 
 # =========================
 # DATA FUNCTIONS
@@ -289,7 +419,7 @@ def write_log(timestamp, tempC, pres_hPa, humRH, status, prediction):
         log.flush()
 
 # =========================
-# GRAPH FUNCTION
+# SVG GRAPH FUNCTION
 # =========================
 
 def make_svg_graph(data, min_val, max_val, colour):
@@ -298,7 +428,6 @@ def make_svg_graph(data, min_val, max_val, colour):
 
     width = 260
     height = 70
-
     points = ""
 
     for i, value in enumerate(data):
@@ -321,6 +450,13 @@ def make_svg_graph(data, min_val, max_val, colour):
 # WEBPAGE
 # =========================
 
+def safe_value(value, decimals=1):
+    if value is None:
+        return "--"
+
+    return f"{value:.{decimals}f}"
+
+
 def make_webpage():
     status_colour = "#35e58a"
 
@@ -334,11 +470,13 @@ def make_webpage():
     hum_graph = make_svg_graph(hum_history, min(hum_history), max(hum_history), "#4dabf7") if hum_history else ""
     pressure_graph = make_svg_graph(pressure_history, min(pressure_history), max(pressure_history), "#845ef7") if pressure_history else ""
 
+    update_file_status = "Yes" if file_exists(DOWNLOADED_UPDATE_FILE) else "No"
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <title>Greenhouse Monitor</title>
-<meta http-equiv="refresh" content="10">
+<meta http-equiv="refresh" content="20">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
 <style>
@@ -357,8 +495,8 @@ body {{
 }}
 
 .card {{
-    width: 370px;
-    background: rgba(255,255,255,0.92);
+    width: 380px;
+    background: rgba(255,255,255,0.94);
     border-radius: 28px;
     padding: 24px;
     box-shadow: 0 20px 45px rgba(40,60,90,0.25);
@@ -458,6 +596,18 @@ body {{
     background: #35e58a;
 }}
 
+.button-blue {{
+    background: #4dabf7;
+}}
+
+.button-purple {{
+    background: #845ef7;
+}}
+
+.button-orange {{
+    background: #ff922b;
+}}
+
 .message {{
     margin-top: 12px;
     font-size: 13px;
@@ -496,22 +646,22 @@ body {{
 
     <div class="box">
         <div class="label">Min Temp</div>
-        <div class="value">{temp_min:.1f}&deg;C</div>
+        <div class="value">{safe_value(temp_min)}&deg;C</div>
     </div>
 
     <div class="box">
         <div class="label">Max Temp</div>
-        <div class="value">{temp_max:.1f}&deg;C</div>
+        <div class="value">{safe_value(temp_max)}&deg;C</div>
     </div>
 
     <div class="box">
         <div class="label">Min Humidity</div>
-        <div class="value">{hum_min:.1f}%</div>
+        <div class="value">{safe_value(hum_min)}%</div>
     </div>
 
     <div class="box">
         <div class="label">Max Humidity</div>
-        <div class="value">{hum_max:.1f}%</div>
+        <div class="value">{safe_value(hum_max)}%</div>
     </div>
 </div>
 
@@ -545,13 +695,23 @@ body {{
     <p>Buzzer Muted: {BUZZER_MUTED}</p>
 </div>
 
+<div class="graphbox">
+    <div class="graph-title">OTA Update</div>
+    <p>Downloaded Update: {update_file_status}</p>
+    <p>Last Message: {last_update_message}</p>
+</div>
+
 <button class="button button-muted" onclick="sendCommand('/mute')">Mute Buzzer</button>
 <button class="button button-good" onclick="sendCommand('/unmute')">Unmute Buzzer</button>
 <button class="button" onclick="sendCommand('/reset')">Reset Min/Max</button>
 
+<button class="button button-blue" onclick="sendCommand('/checkupdate')">Check / Download Update</button>
+<button class="button button-purple" onclick="sendCommand('/installupdate')">Install Update</button>
+<button class="button button-orange" onclick="sendCommand('/reboot')">Reboot Pico</button>
+
 <div class="message" id="message"></div>
 
-<div class="footer">Auto refreshes every 10 seconds</div>
+<div class="footer">Auto refreshes every 20 seconds</div>
 
 </div>
 
@@ -566,7 +726,7 @@ function sendCommand(path) {{
 
         setTimeout(() => {{
             location.reload();
-        }}, 500);
+        }}, 800);
     }})
     .catch(error => {{
         document.getElementById("message").innerHTML = "Command failed";
@@ -580,7 +740,7 @@ function sendCommand(path) {{
 """
 
 # =========================
-# WEB REQUEST HANDLER
+# WEB RESPONSE HELPERS
 # =========================
 
 def send_text_response(client, message):
@@ -598,12 +758,16 @@ def send_html_response(client, html):
     client.sendall(html)
     client.close()
 
+# =========================
+# WEB REQUEST HANDLER
+# =========================
 
 def check_web_request():
     global BUZZER_MUTED
     global temp_min, temp_max
     global hum_min, hum_max
     global pressure_min, pressure_max
+    global last_update_message
 
     try:
         client, addr = server.accept()
@@ -630,6 +794,23 @@ def check_web_request():
             send_text_response(client, "Min/max reset")
             return
 
+        elif "GET /checkupdate" in request:
+            message = download_update()
+            send_text_response(client, message)
+            return
+
+        elif "GET /installupdate" in request:
+            send_text_response(client, "Installing update and rebooting")
+            sleep_ms(500)
+            install_update()
+            return
+
+        elif "GET /reboot" in request:
+            send_text_response(client, "Rebooting Pico")
+            sleep_ms(500)
+            reboot_pico()
+            return
+
         else:
             html = make_webpage()
             send_html_response(client, html)
@@ -637,6 +818,12 @@ def check_web_request():
 
     except OSError:
         pass
+
+    except Exception as e:
+        try:
+            client.close()
+        except:
+            pass
 
 # =========================
 # OLED DISPLAY
@@ -650,7 +837,7 @@ def update_oled(tempC, humRH, pres_hPa, status, time_part):
     if time.ticks_diff(now_ms, last_page_change) >= PAGE_CHANGE_MS:
         page += 1
 
-        if page > 3:
+        if page > 4:
             page = 0
 
         last_page_change = now_ms
@@ -683,6 +870,11 @@ def update_oled(tempC, humRH, pres_hPa, status, time_part):
         display.text(ip, 0, 16, 1)
         display.text("Open browser", 0, 34, 1)
 
+    elif page == 4:
+        display.text("OTA UPDATE", 0, 0, 1)
+        display.text("GitHub ready", 0, 16, 1)
+        display.text("Use web page", 0, 34, 1)
+
     display.show()
 
 # =========================
@@ -698,50 +890,56 @@ def take_sensor_sample():
     global weather_prediction
     global last_buzzer_time
 
-    tempC, presPa, humRH = sensor.values()
-    pres_hPa = presPa / 100
+    try:
+        tempC, presPa, humRH = sensor.values()
+        pres_hPa = presPa / 100
 
-    timestamp = rtc.timestamp()
-    time_part = timestamp[11:19]
+        timestamp = rtc.timestamp()
+        time_part = timestamp[11:19]
 
-    latest_timestamp = timestamp
-    latest_temp = tempC
-    latest_pressure = pres_hPa
-    latest_humidity = humRH
+        latest_timestamp = timestamp
+        latest_temp = tempC
+        latest_pressure = pres_hPa
+        latest_humidity = humRH
 
-    add_history(tempC, humRH, pres_hPa)
-    weather_prediction = update_weather_prediction()
+        add_history(tempC, humRH, pres_hPa)
+        weather_prediction = update_weather_prediction()
 
-    filename = get_log_filename(timestamp)
-    open_log_if_needed(filename, tempC, humRH, pres_hPa)
+        filename = get_log_filename(timestamp)
+        open_log_if_needed(filename, tempC, humRH, pres_hPa)
 
-    update_min_max(tempC, humRH, pres_hPa)
+        update_min_max(tempC, humRH, pres_hPa)
 
-    status = get_status(tempC, humRH)
-    latest_status = status
+        status = get_status(tempC, humRH)
+        latest_status = status
 
-    now_ms = time.ticks_ms()
+        now_ms = time.ticks_ms()
 
-    if BUZZER_ON and not BUZZER_MUTED and status != "OK":
-        if time.ticks_diff(now_ms, last_buzzer_time) >= BUZZER_REPEAT_MS:
-            warning_melody()
-            last_buzzer_time = now_ms
-    else:
-        buzzer.noTone()
+        if BUZZER_ON and not BUZZER_MUTED and status != "OK":
+            if time.ticks_diff(now_ms, last_buzzer_time) >= BUZZER_REPEAT_MS:
+                warning_melody()
+                last_buzzer_time = now_ms
+        else:
+            buzzer.noTone()
 
-    write_log(timestamp, tempC, pres_hPa, humRH, status, weather_prediction)
+        write_log(timestamp, tempC, pres_hPa, humRH, status, weather_prediction)
 
-    print(
-        f"{timestamp}, "
-        f"{tempC:.2f} C, "
-        f"{pres_hPa:.2f} hPa, "
-        f"{humRH:.2f} %RH, "
-        f"{status}, "
-        f"Muted: {BUZZER_MUTED}, "
-        f"IP: {ip}"
-    )
+        print(
+            f"{timestamp}, "
+            f"{tempC:.2f} C, "
+            f"{pres_hPa:.2f} hPa, "
+            f"{humRH:.2f} %RH, "
+            f"{status}, "
+            f"Muted: {BUZZER_MUTED}, "
+            f"IP: {ip}"
+        )
 
-    update_oled(tempC, humRH, pres_hPa, status, time_part)
+        update_oled(tempC, humRH, pres_hPa, status, time_part)
+
+    except Exception as e:
+        latest_status = "SENSOR ERROR"
+        oled_message("Sensor Error", "Check wiring")
+        print("Sensor error:", e)
 
 # =========================
 # MAIN LOOP
@@ -760,4 +958,3 @@ while True:
         last_sample_ms = now_ms
 
     sleep_ms(WEB_CHECK_INTERVAL_MS)
-
